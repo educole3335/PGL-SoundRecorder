@@ -22,6 +22,7 @@ import {
   deleteStoredRecording,
   getStoredRecordings,
   saveRecordingFromUri,
+  clearStoredRecordings,
 } from '../services/recordingsService';
 import { StoredRecording } from '../types/recording';
 
@@ -53,9 +54,9 @@ type MicGlyphProps = {
 function MicGlyph({ size = 52, color = '#ffffff', isRecording = false }: Readonly<MicGlyphProps>) {
   return (
     <MaterialCommunityIcons
-      name={isRecording ? 'record-rec' : 'microphone'}
-      size={size}
-      color={color}
+      name={isRecording ? 'stop' : 'microphone'}
+      size={isRecording ? Math.max(24, size - 8) : size}
+      color={isRecording ? '#f7d4df' : color}
     />
   );
 }
@@ -77,11 +78,17 @@ export default function RecorderScreen() {
   const [isRecording, setIsRecording] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [playingId, setPlayingId] = useState<string | null>(null);
+  const [playbackProgress, setPlaybackProgress] = useState<{ position: number; duration: number } | null>(null);
+  const [isPlaybackPaused, setIsPlaybackPaused] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [message, setMessage] = useState('Toca para comenzar a grabar');
   const [isNameModalVisible, setIsNameModalVisible] = useState(false);
   const [recordingName, setRecordingName] = useState('');
-  const [pendingRecording, setPendingRecording] = useState<{ uri: string; durationMs: number } | null>(null);
+  const [pendingRecording, setPendingRecording] = useState<{
+    uri: string;
+    fallbackUri: string | null;
+    durationMs: number;
+  } | null>(null);
 
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
@@ -95,6 +102,28 @@ export default function RecorderScreen() {
     new Animated.Value(0.52),
     new Animated.Value(0.3),
   ]).current;
+
+  const setRecordingAudioMode = async () => {
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: true,
+      interruptionModeIOS: InterruptionModeIOS.DoNotMix,
+      playsInSilentModeIOS: true,
+      shouldDuckAndroid: false,
+      interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
+      playThroughEarpieceAndroid: false,
+    });
+  };
+
+  const setPlaybackAudioMode = async () => {
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: false,
+      interruptionModeIOS: InterruptionModeIOS.DoNotMix,
+      playsInSilentModeIOS: true,
+      shouldDuckAndroid: false,
+      interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
+      playThroughEarpieceAndroid: false,
+    });
+  };
 
   const helperText = useMemo(() => {
     if (isLoadingInitial) {
@@ -110,14 +139,7 @@ export default function RecorderScreen() {
 
   useEffect(() => {
     const configureAudio = async () => {
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        interruptionModeIOS: InterruptionModeIOS.DoNotMix,
-        playsInSilentModeIOS: true,
-        shouldDuckAndroid: true,
-        interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
-        playThroughEarpieceAndroid: false,
-      });
+      await setPlaybackAudioMode();
     };
 
     const loadRecordings = async () => {
@@ -258,6 +280,8 @@ export default function RecorderScreen() {
   const unloadSound = async () => {
     if (!soundRef.current) {
       setPlayingId(null);
+      setPlaybackProgress(null);
+      setIsPlaybackPaused(false);
       return;
     }
 
@@ -266,6 +290,20 @@ export default function RecorderScreen() {
     } finally {
       soundRef.current = null;
       setPlayingId(null);
+      setPlaybackProgress(null);
+      setIsPlaybackPaused(false);
+    }
+  };
+
+  const cleanupTempUri = async (uri: string | null | undefined) => {
+    if (!uri) {
+      return;
+    }
+
+    try {
+      await FileSystem.deleteAsync(uri, { idempotent: true });
+    } catch {
+      // Temp cleanup should never break the save flow.
     }
   };
 
@@ -285,6 +323,7 @@ export default function RecorderScreen() {
       }
 
       await unloadSound();
+      await setRecordingAudioMode();
       setElapsedSeconds(0);
 
       const createdRecording = await Audio.Recording.createAsync(
@@ -314,34 +353,63 @@ export default function RecorderScreen() {
       clearTimer();
 
       await activeRecording.stopAndUnloadAsync();
+      await setPlaybackAudioMode();
       recordingRef.current = null;
 
       const sourceUri = activeRecording.getURI();
       const durationMs = elapsedSeconds * 1000;
 
       setIsRecording(false);
-      setIsSaving(false);
 
       if (!sourceUri) {
         setMessage('No se pudo guardar la grabacion');
         return;
       }
 
-      if (!FileSystem.documentDirectory) {
-        setMessage('No se pudo preparar el archivo para guardar');
+      // Validar que el archivo existe
+      const sourceFileInfo = await FileSystem.getInfoAsync(sourceUri);
+      if (!sourceFileInfo.exists) {
+        setMessage('El archivo de grabación temporal no existe');
         return;
       }
 
-      const pendingDirectory = `${FileSystem.documentDirectory}pending-recordings`;
-      await FileSystem.makeDirectoryAsync(pendingDirectory, { intermediates: true });
-      const pendingUri = `${pendingDirectory}/pending-${Date.now()}.${getFileExtension(sourceUri)}`;
-      await FileSystem.copyAsync({ from: sourceUri, to: pendingUri });
+      let stagedUri = sourceUri;
 
-      setPendingRecording({ uri: pendingUri, durationMs });
+      if (FileSystem.documentDirectory) {
+        try {
+          const pendingDirectory = `${FileSystem.documentDirectory}pending-recordings`;
+          await FileSystem.makeDirectoryAsync(pendingDirectory, { intermediates: true });
+          const candidateUri = `${pendingDirectory}/pending-${Date.now()}.${getFileExtension(sourceUri)}`;
+          await FileSystem.copyAsync({ from: sourceUri, to: candidateUri });
+          const stagedFile = await FileSystem.getInfoAsync(candidateUri);
+
+          if (stagedFile.exists) {
+            stagedUri = candidateUri;
+          }
+        } catch (error) {
+          console.warn('Failed to stage recording to pending directory:', error);
+          // Si staging falla, continuar con el URI original
+          stagedUri = sourceUri;
+        }
+      }
+
+      // Validar que el archivo staged existe antes de mostrar el modal
+      const stagedFileInfo = await FileSystem.getInfoAsync(stagedUri);
+      if (!stagedFileInfo.exists) {
+        setMessage('No se pudo preparar el archivo de grabación');
+        return;
+      }
+
+      setPendingRecording({
+        uri: stagedUri,
+        fallbackUri: stagedUri === sourceUri ? null : sourceUri,
+        durationMs,
+      });
       setRecordingName(getDefaultRecordingName());
       setIsNameModalVisible(true);
       setMessage('Elige un nombre para guardar la grabacion');
-    } catch {
+    } catch (error) {
+      console.error('Error stopping recording:', error);
       setMessage('Ocurrio un error al detener la grabacion');
     } finally {
       setIsRecording(false);
@@ -354,59 +422,117 @@ export default function RecorderScreen() {
       return;
     }
 
+    // Guardar referencias locales antes de cambiar el estado
+    const pendingUri = pendingRecording.uri;
+    const pendingFallbackUri = pendingRecording.fallbackUri;
+
     try {
       setIsSaving(true);
       const finalRecordingName = recordingName.trim() || getDefaultRecordingName();
-      const savedRecording = await saveRecordingFromUri(
-        pendingRecording.uri,
-        pendingRecording.durationMs,
-        finalRecordingName
-      );
-      await FileSystem.deleteAsync(pendingRecording.uri, { idempotent: true });
+
+      let savedRecording: StoredRecording;
+      try {
+        savedRecording = await saveRecordingFromUri(
+          pendingUri,
+          pendingRecording.durationMs,
+          finalRecordingName
+        );
+      } catch (error) {
+        if (!pendingFallbackUri) {
+          throw new Error(`Primary save failed and fallback URI unavailable: ${error}`);
+        }
+
+        savedRecording = await saveRecordingFromUri(
+          pendingFallbackUri,
+          pendingRecording.durationMs,
+          finalRecordingName
+        );
+      }
+
+      // Actualizar la lista de grabaciones
       setRecordings((currentRecordings) => [savedRecording, ...currentRecordings]);
       setMessage('Grabacion guardada correctamente');
+      
+      // Limpiar estados
       setIsNameModalVisible(false);
       setPendingRecording(null);
       setRecordingName('');
-    } catch {
-      setMessage('No se pudo guardar la grabacion');
+
+      // Limpiar archivos temporales después de actualizar el estado
+      await cleanupTempUri(pendingUri);
+      await cleanupTempUri(pendingFallbackUri);
+    } catch (error) {
+      console.error('Error saving recording:', error);
+      setMessage(`Error al guardar: ${error instanceof Error ? error.message : 'Error desconocido'}`);
+      // No cerrar el modal para que el usuario pueda reintentar
     } finally {
       setIsSaving(false);
     }
   };
 
   const cancelRecordingName = () => {
-    if (pendingRecording?.uri) {
-      void FileSystem.deleteAsync(pendingRecording.uri, { idempotent: true });
-    }
+    // Guardar referencias locales antes de cambiar el estado
+    const pendingUri = pendingRecording?.uri;
+    const pendingFallbackUri = pendingRecording?.fallbackUri;
 
     setIsNameModalVisible(false);
     setPendingRecording(null);
     setRecordingName('');
     setMessage('Grabacion descartada');
+
+    // Limpiar archivos temporales en background
+    void cleanupTempUri(pendingUri);
+    void cleanupTempUri(pendingFallbackUri);
   };
 
   const playRecording = async (recording: StoredRecording) => {
-    if (playingId === recording.id) {
+    if (playingId === recording.id && soundRef.current) {
+      try {
+        if (isPlaybackPaused) {
+          await soundRef.current.playAsync();
+          setIsPlaybackPaused(false);
+          setMessage('Reproduciendo grabacion...');
+        } else {
+          await soundRef.current.pauseAsync();
+          setIsPlaybackPaused(true);
+          setMessage('Reproduccion pausada');
+        }
+      } catch {
+        setMessage('No se pudo pausar o reanudar la grabacion');
+      }
+
       return;
     }
 
     try {
       await unloadSound();
+      await setPlaybackAudioMode();
       setMessage('Reproduciendo grabacion...');
       setPlayingId(recording.id);
+      setIsPlaybackPaused(false);
+      setPlaybackProgress({ position: 0, duration: recording.durationMs });
 
       const { sound } = await Audio.Sound.createAsync({ uri: recording.uri });
       soundRef.current = sound;
+      await sound.setVolumeAsync(1);
 
       sound.setOnPlaybackStatusUpdate((status) => {
         if (!status.isLoaded) {
           return;
         }
 
+        if (status.positionMillis !== undefined && status.durationMillis !== undefined) {
+          setPlaybackProgress({
+            position: status.positionMillis,
+            duration: status.durationMillis,
+          });
+        }
+
         if (status.didJustFinish) {
           setMessage('Reproduccion terminada');
           setPlayingId(null);
+          setPlaybackProgress(null);
+          setIsPlaybackPaused(false);
         }
       });
 
@@ -414,6 +540,8 @@ export default function RecorderScreen() {
     } catch {
       setMessage('No se pudo reproducir la grabacion');
       setPlayingId(null);
+      setPlaybackProgress(null);
+      setIsPlaybackPaused(false);
     }
   };
 
@@ -428,6 +556,20 @@ export default function RecorderScreen() {
       setMessage(nextRecordings.length > 0 ? 'Grabacion eliminada' : 'Aun no tienes grabaciones');
     } catch {
       setMessage('No se pudo borrar la grabacion');
+    }
+  };
+
+  const clearAllRecordings = async () => {
+    try {
+      if (playingId) {
+        await unloadSound();
+      }
+
+      await clearStoredRecordings();
+      setRecordings([]);
+      setMessage('Todas las grabaciones fueron eliminadas');
+    } catch {
+      setMessage('No se pudieron borrar todas las grabaciones');
     }
   };
 
@@ -546,7 +688,23 @@ export default function RecorderScreen() {
         <View style={styles.listSection}>
           <View style={styles.listHeader}>
             <Text style={styles.listTitle}>Mis grabaciones</Text>
-            <Text style={styles.listCount}>{recordings.length}</Text>
+            <View style={styles.headerActions}>
+              <Text style={styles.listCount}>{recordings.length}</Text>
+              {recordings.length > 0 && (
+                <Pressable
+                  onPress={() => {
+                    void clearAllRecordings();
+                  }}
+                  style={({ pressed }) => [
+                    styles.clearAllButton,
+                    pressed && styles.clearAllButtonPressed,
+                  ]}
+                >
+                  <MaterialCommunityIcons name="delete" size={18} color="#c63c49" />
+                  <Text style={styles.clearAllButtonText}>Borrar todos</Text>
+                </Pressable>
+              )}
+            </View>
           </View>
 
           {recordings.length === 0 ? (
@@ -564,7 +722,9 @@ export default function RecorderScreen() {
               renderItem={({ item }) => (
                 <RecordingCard
                   recording={item}
-                  isPlaying={playingId === item.id}
+                  isPlaying={playingId === item.id && !isPlaybackPaused}
+                  isPaused={playingId === item.id && isPlaybackPaused}
+                  playbackProgress={playingId === item.id ? playbackProgress : null}
                   onPlay={() => {
                     void playRecording(item);
                   }}
@@ -787,6 +947,29 @@ const styles = StyleSheet.create({
     lineHeight: 28,
     fontSize: 13,
     fontWeight: '700',
+  },
+  headerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  clearAllButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    backgroundColor: '#f3efe6',
+  },
+  clearAllButtonPressed: {
+    backgroundColor: '#e5d9cd',
+    opacity: 0.8,
+  },
+  clearAllButtonText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#c63c49',
   },
   emptyState: {
     flex: 1,
