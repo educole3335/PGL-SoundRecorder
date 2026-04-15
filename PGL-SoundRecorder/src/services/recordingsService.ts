@@ -1,9 +1,8 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 
 import { StoredRecording } from '../types/recording';
 
-const STORAGE_KEY = '@pgl-sound-recorder/recordings';
+const RECORDINGS_METADATA_FILE = `${FileSystem.documentDirectory}recordings-metadata.json`;
 
 function parseJson<T>(rawValue: string | null, fallbackValue: T): T {
   if (!rawValue) {
@@ -12,22 +11,47 @@ function parseJson<T>(rawValue: string | null, fallbackValue: T): T {
 
   try {
     return JSON.parse(rawValue) as T;
-  } catch {
+  } catch (error) {
+    console.warn('Error parsing JSON:', error);
     return fallbackValue;
   }
 }
 
 async function readRecordings(): Promise<StoredRecording[]> {
-  const rawValue = await AsyncStorage.getItem(STORAGE_KEY);
-  const recordings = parseJson<StoredRecording[]>(rawValue, []);
+  try {
+    if (!RECORDINGS_METADATA_FILE) {
+      return [];
+    }
 
-  return recordings.sort((first, second) => {
-    return new Date(second.createdAt).getTime() - new Date(first.createdAt).getTime();
-  });
+    const fileInfo = await FileSystem.getInfoAsync(RECORDINGS_METADATA_FILE);
+    if (!fileInfo.exists) {
+      return [];
+    }
+
+    const rawValue = await FileSystem.readAsStringAsync(RECORDINGS_METADATA_FILE);
+    const recordings = parseJson<StoredRecording[]>(rawValue, []);
+
+    return recordings.sort((first, second) => {
+      return new Date(second.createdAt).getTime() - new Date(first.createdAt).getTime();
+    });
+  } catch (error) {
+    console.warn('Error reading recordings metadata:', error);
+    return [];
+  }
 }
 
 async function writeRecordings(recordings: StoredRecording[]): Promise<void> {
-  await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(recordings));
+  try {
+    if (!RECORDINGS_METADATA_FILE) {
+      throw new Error('Document directory is not available.');
+    }
+
+    const jsonData = JSON.stringify(recordings, null, 2);
+    await FileSystem.writeAsStringAsync(RECORDINGS_METADATA_FILE, jsonData);
+  } catch (error) {
+    console.error('Error writing recordings metadata:', error);
+    throw error;
+  }
 }
 
 function formatTitle(dateValue: string): string {
@@ -89,7 +113,22 @@ export async function saveRecordingFromUri(
   const fileName = `${id}.${getExtension(sourceUri)}`;
   const destinationUri = `${directory}/${fileName}`;
 
-  await FileSystem.copyAsync({ from: sourceUri, to: destinationUri });
+  const sourceInfo = await FileSystem.getInfoAsync(sourceUri);
+  if (!sourceInfo.exists) {
+    throw new Error('The recording source file does not exist.');
+  }
+
+  try {
+    await FileSystem.copyAsync({ from: sourceUri, to: destinationUri });
+  } catch {
+    await FileSystem.moveAsync({ from: sourceUri, to: destinationUri });
+  }
+
+  // Validar que el archivo se guardó correctamente
+  const savedFileInfo = await FileSystem.getInfoAsync(destinationUri);
+  if (!savedFileInfo.exists) {
+    throw new Error('Failed to save recording file to destination.');
+  }
 
   const newRecording: StoredRecording = {
     id,
@@ -101,7 +140,14 @@ export async function saveRecordingFromUri(
   };
 
   const recordings = await readRecordings();
-  await writeRecordings([newRecording, ...recordings]);
+  const updatedRecordings = [newRecording, ...recordings];
+  await writeRecordings(updatedRecordings);
+
+  // Validar que se guardó en el archivo de metadatos
+  const verificacion = await readRecordings();
+  if (!verificacion.find((r) => r.id === id)) {
+    throw new Error('Failed to save recording metadata to file.');
+  }
 
   return newRecording;
 }
@@ -127,5 +173,7 @@ export async function clearStoredRecordings(): Promise<void> {
     await FileSystem.deleteAsync(recording.uri, { idempotent: true });
   }
 
-  await AsyncStorage.removeItem(STORAGE_KEY);
+  if (RECORDINGS_METADATA_FILE) {
+    await FileSystem.deleteAsync(RECORDINGS_METADATA_FILE, { idempotent: true });
+  }
 }
