@@ -1,11 +1,14 @@
 import { useEffect, useRef } from 'react';
 import { Animated, Pressable, StyleSheet, Text, View } from 'react-native';
+import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
 
 import { StoredRecording } from '../types/recording';
 
 type RecordingCardProps = {
   recording: StoredRecording;
   isPlaying: boolean;
+  isPaused: boolean;
+  playbackProgress: { position: number; duration: number } | null;
   onPlay: () => void;
   onDelete: () => void;
 };
@@ -29,8 +32,18 @@ function formatDate(dateValue: string): string {
   }).format(new Date(dateValue));
 }
 
-export default function RecordingCard({ recording, isPlaying, onPlay, onDelete }: RecordingCardProps) {
+export default function RecordingCard({
+  recording,
+  isPlaying,
+  isPaused,
+  playbackProgress,
+  onPlay,
+  onDelete,
+}: RecordingCardProps) {
   const appearValue = useRef(new Animated.Value(0)).current;
+  const playButtonScale = useRef(new Animated.Value(1)).current;
+  const deleteButtonScale = useRef(new Animated.Value(1)).current;
+  const deleteButtonRotate = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
     Animated.spring(appearValue, {
@@ -41,10 +54,68 @@ export default function RecordingCard({ recording, isPlaying, onPlay, onDelete }
     }).start();
   }, [appearValue]);
 
+  // Animar el botón de play cuando cambia estado
+  useEffect(() => {
+    Animated.sequence([
+      Animated.timing(playButtonScale, {
+        toValue: 1.12,
+        duration: 220,
+        useNativeDriver: true,
+      }),
+      Animated.timing(playButtonScale, {
+        toValue: 1,
+        duration: 120,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [isPaused, isPlaying, playButtonScale]);
+
+  const handleDeletePress = () => {
+    // Animar el botón de delete con escala y rotación
+    Animated.parallel([
+      Animated.sequence([
+        Animated.timing(deleteButtonScale, {
+          toValue: 0.92,
+          duration: 100,
+          useNativeDriver: true,
+        }),
+        Animated.timing(deleteButtonScale, {
+          toValue: 1.08,
+          duration: 150,
+          useNativeDriver: true,
+        }),
+        Animated.timing(deleteButtonScale, {
+          toValue: 1,
+          duration: 100,
+          useNativeDriver: true,
+        }),
+      ]),
+      Animated.sequence([
+        Animated.timing(deleteButtonRotate, {
+          toValue: 1,
+          duration: 350,
+          useNativeDriver: true,
+        }),
+      ]),
+    ]).start();
+
+    onDelete();
+  };
+
   const translateY = appearValue.interpolate({
     inputRange: [0, 1],
     outputRange: [12, 0],
   });
+
+  const deleteRotation = deleteButtonRotate.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0deg', '12deg'],
+  });
+
+  const progressPercent =
+    playbackProgress && playbackProgress.duration > 0
+      ? (playbackProgress.position / playbackProgress.duration) * 100
+      : 0;
 
   return (
     <Animated.View
@@ -56,41 +127,88 @@ export default function RecordingCard({ recording, isPlaying, onPlay, onDelete }
         },
       ]}
     >
-      <View style={styles.textBlock}>
-        <Text style={styles.title}>{recording.title}</Text>
-        <Text style={styles.meta}>{formatDate(recording.createdAt)}</Text>
-        <Text style={styles.meta}>{formatDuration(recording.durationMs)}</Text>
+      <View style={styles.mainContent}>
+        <View style={styles.textBlock}>
+          <Text style={styles.title}>{recording.title}</Text>
+          <Text style={styles.meta}>{formatDate(recording.createdAt)}</Text>
+          <Text style={styles.meta}>
+            {(isPlaying || isPaused) && playbackProgress
+              ? `${formatDuration(playbackProgress.position)} / ${formatDuration(recording.durationMs)}`
+              : formatDuration(recording.durationMs)}
+          </Text>
+        </View>
+
+        <View style={styles.actions}>
+          <Animated.View
+            style={[
+              styles.animatedButtonWrapper,
+              {
+                transform: [{ scale: playButtonScale }],
+              },
+            ]}
+          >
+            <Pressable
+              onPress={onPlay}
+              style={({ pressed }) => [
+                styles.actionButton,
+                styles.playButton,
+                pressed && styles.pressed,
+                (isPlaying || isPaused) && styles.playingButton,
+              ]}
+            >
+              <MaterialCommunityIcons
+                name={isPlaying ? 'pause' : 'play'}
+                size={20}
+                color="#ffffff"
+              />
+            </Pressable>
+          </Animated.View>
+
+          <Animated.View
+            style={[
+              styles.animatedButtonWrapper,
+              {
+                transform: [
+                  { scale: deleteButtonScale },
+                  { rotate: deleteRotation },
+                ],
+              },
+            ]}
+          >
+            <Pressable
+              onPress={handleDeletePress}
+              style={({ pressed }) => [
+                styles.actionButton,
+                styles.deleteButton,
+                pressed && styles.deleteButtonPressed,
+              ]}
+            >
+              <MaterialCommunityIcons name="trash-can" size={20} color="#c63c49" />
+            </Pressable>
+          </Animated.View>
+        </View>
       </View>
 
-      <View style={styles.actions}>
-        <Pressable
-          onPress={onPlay}
-          style={({ pressed }) => [
-            styles.actionButton,
-            styles.playButton,
-            pressed && styles.pressed,
-            isPlaying && styles.playingButton,
-          ]}
-        >
-          <Text style={styles.actionText}>{isPlaying ? '...' : 'Play'}</Text>
-        </Pressable>
-
-        <Pressable
-          onPress={onDelete}
-          style={({ pressed }) => [styles.actionButton, styles.deleteButton, pressed && styles.pressed]}
-        >
-          <Text style={styles.actionText}>Borrar</Text>
-        </Pressable>
-      </View>
+      {(isPlaying || isPaused) && (
+        <View style={styles.progressBarContainer}>
+          <View style={styles.progressBarBackground}>
+            <View
+              style={[
+                styles.progressBarFill,
+                {
+                  width: `${progressPercent}%`,
+                },
+              ]}
+            />
+          </View>
+        </View>
+      )}
     </Animated.View>
   );
 }
 
 const styles = StyleSheet.create({
   card: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
     borderRadius: 18,
     backgroundColor: '#fffdfa',
     paddingHorizontal: 14,
@@ -102,6 +220,12 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.06,
     shadowRadius: 8,
     elevation: 2,
+    gap: 8,
+  },
+  mainContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     gap: 12,
   },
   textBlock: {
@@ -122,29 +246,53 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 8,
   },
+  animatedButtonWrapper: {
+    overflow: 'hidden',
+    borderRadius: 12,
+  },
   actionButton: {
-    minWidth: 70,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 14,
+    width: 44,
+    height: 44,
+    borderRadius: 12,
     alignItems: 'center',
+    justifyContent: 'center',
   },
   playButton: {
     backgroundColor: '#8a0f44',
   },
   deleteButton: {
-    backgroundColor: '#c63c49',
+    backgroundColor: '#ffffff',
+    borderWidth: 1.5,
+    borderColor: '#c63c49',
   },
   playingButton: {
     backgroundColor: '#5b0a2d',
+    shadowColor: '#b81a57',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.5,
+    shadowRadius: 12,
+    elevation: 8,
   },
-  actionText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '700',
+  deleteButtonPressed: {
+    backgroundColor: '#c63c4922',
+    opacity: 0.9,
   },
   pressed: {
-    opacity: 0.82,
-    transform: [{ scale: 0.98 }],
+    opacity: 0.75,
+  },
+  progressBarContainer: {
+    paddingHorizontal: 0,
+    paddingTop: 8,
+  },
+  progressBarBackground: {
+    height: 4,
+    backgroundColor: '#e5e7eb',
+    borderRadius: 2,
+    overflow: 'hidden',
+  },
+  progressBarFill: {
+    height: '100%',
+    backgroundColor: '#c63c49',
+    borderRadius: 2,
   },
 });
